@@ -50,6 +50,18 @@ def determine_primary_secondary_gpus(cfg):
     print("--------------------------------------------------------")
 
 
+def set_single_gpu(cfg, gpu_id):
+    print("------------------ GPU Configurations ------------------")
+    cfg.single_gpu = True
+    cfg.n_gpus = 1
+    cfg.primary_gpus = [gpu_id]
+    cfg.secondary_gpus = [gpu_id]
+
+    print(f"Primary GPUs: {cfg.primary_gpus}")
+    print(f"Secondary GPUs: {cfg.secondary_gpus}")
+    print("--------------------------------------------------------")
+
+
 def make_cfg(args):
     cfg = get_cfg_defaults()
     cfg.merge_from_file('configs/default.yaml')
@@ -57,7 +69,9 @@ def make_cfg(args):
     cfg.merge_from_list(args.opts)
     parse_cfg(cfg)
 
-    determine_primary_secondary_gpus(cfg)
+    cfg.single_gpu = False
+    set_single_gpu(cfg, 1)
+    # determine_primary_secondary_gpus(cfg)
         
     return cfg
 

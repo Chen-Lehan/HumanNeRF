@@ -16,6 +16,8 @@ from configs import cfg
 class Network(nn.Module):
     def __init__(self):
         super(Network, self).__init__()
+        if cfg.single_gpu == True:
+            torch.cuda.set_device(cfg.primary_gpus[0])
 
         # motion basis computer
         self.motion_basis_computer = MotionBasisComputer(
