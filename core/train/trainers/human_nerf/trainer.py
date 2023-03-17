@@ -59,9 +59,9 @@ class Trainer(object):
         self.timer = Timer()
 
         if "lpips" in cfg.train.lossweights.keys():
-            self.lpips = LPIPS(net='vgg')
+            self.lpips = LPIPS(net='vgg').to(cfg.primary_gpus[0])
             set_requires_grad(self.lpips, requires_grad=False)
-            self.lpips = nn.DataParallel(self.lpips).cuda()
+            # self.lpips = nn.DataParallel(self.lpips).cuda()
 
         print("Load Progress Dataset ...")
         self.prog_dataloader = create_dataloader(data_type='progress')

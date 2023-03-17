@@ -17,8 +17,9 @@ EXCLUDE_KEYS_TO_GPU = ['frame_name',
 
 def load_network():
     model = create_network()
-    ckpt_path = os.path.join(cfg.logdir, f'{cfg.load_net}.tar')
-    ckpt = torch.load(ckpt_path, map_location='cuda:0')
+    # ckpt_path = os.path.join(cfg.logdir, f'{cfg.load_net}.tar')
+    ckpt_path = 'experiments/human_nerf/zju_mocap/p387/single_gpu_v_0/latest.tar'
+    ckpt = torch.load(ckpt_path, map_location='cuda:1')
     model.load_state_dict(ckpt['network'], strict=False)
     print('load network from ', ckpt_path)
     return model.cuda().deploy_mlps_to_secondary_gpus()

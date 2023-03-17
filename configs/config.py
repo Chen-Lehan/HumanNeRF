@@ -70,7 +70,7 @@ def make_cfg(args):
     parse_cfg(cfg)
 
     cfg.single_gpu = False
-    set_single_gpu(cfg, 1)
+    set_single_gpu(cfg, 2)
     # determine_primary_secondary_gpus(cfg)
         
     return cfg

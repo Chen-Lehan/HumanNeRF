@@ -8,7 +8,8 @@ from core.nets.human_nerf.component_factory import \
     load_canonical_mlp, \
     load_mweight_vol_decoder, \
     load_pose_decoder, \
-    load_non_rigid_motion_mlp
+    load_non_rigid_motion_mlp, \
+    load_vibe
 
 from configs import cfg
 
@@ -18,6 +19,9 @@ class Network(nn.Module):
         super(Network, self).__init__()
         if cfg.single_gpu == True:
             torch.cuda.set_device(cfg.primary_gpus[0])
+
+        # pose detector
+        self.pose_detector = None #load_vibe() # TODO
 
         # motion basis computer
         self.motion_basis_computer = MotionBasisComputer(
@@ -44,12 +48,12 @@ class Network(nn.Module):
                 condition_code_size=cfg.non_rigid_motion_mlp.condition_code_size,
                 mlp_width=cfg.non_rigid_motion_mlp.mlp_width,
                 mlp_depth=cfg.non_rigid_motion_mlp.mlp_depth,
-                skips=cfg.non_rigid_motion_mlp.skips)
-        self.non_rigid_mlp = \
-            nn.DataParallel(
-                self.non_rigid_mlp,
-                device_ids=cfg.secondary_gpus,
-                output_device=cfg.secondary_gpus[0])
+                skips=cfg.non_rigid_motion_mlp.skips).to(cfg.primary_gpus[0])
+        # self.non_rigid_mlp = \
+        #     nn.DataParallel(
+        #         self.non_rigid_mlp,
+        #         device_ids=cfg.secondary_gpus,
+        #         output_device=cfg.secondary_gpus[0])
 
         # canonical positional encoding
         get_embedder = load_positional_embedder(cfg.embedder.module)
@@ -65,12 +69,12 @@ class Network(nn.Module):
                 input_ch=cnl_pos_embed_size, 
                 mlp_depth=cfg.canonical_mlp.mlp_depth, 
                 mlp_width=cfg.canonical_mlp.mlp_width,
-                skips=skips)
-        self.cnl_mlp = \
-            nn.DataParallel(
-                self.cnl_mlp,
-                device_ids=cfg.secondary_gpus,
-                output_device=cfg.primary_gpus[0])
+                skips=skips).to(cfg.primary_gpus[0])
+        # self.cnl_mlp = \
+        #     nn.DataParallel(
+        #         self.cnl_mlp,
+        #         device_ids=cfg.secondary_gpus,
+        #         output_device=cfg.primary_gpus[0])
 
         # pose decoder MLP
         self.pose_decoder = \
