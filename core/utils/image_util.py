@@ -4,6 +4,8 @@ import shutil
 from termcolor import colored
 from PIL import Image
 import numpy as np
+from skimage.util.shape import view_as_windows
+
 
 
 def load_image(path, to_rgb=True):
@@ -48,6 +50,13 @@ def tile_images(images, imgs_per_row=4):
         rows.pop()
     imgout = np.concatenate(rows, axis=0)
     return imgout
+
+
+def split_into_chunks(framelist, seqlen, stride):
+    indexes = np.arange(0, len(framelist))
+    chunks = view_as_windows(indexes, (seqlen,), step=stride)
+    start_finish = chunks[:, (0, -1)].tolist()
+    return start_finish
 
      
 class ImageWriter():

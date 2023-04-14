@@ -1,17 +1,398 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
-from core.utils.network_util import MotionBasisComputer
-from core.nets.human_nerf.component_factory import \
+import os.path as osp
+
+from core.utils.network_util import MotionBasisComputer, RodriguesModule
+from core.utils.body_util import SMPL_PARENT, BONE_STDS, HEAD_STDS, JOINT_STDS, SMPL_JOINT_IDX, TORSO_JOINTS
+from core.nets.human_vibe_nerf.component_factory import \
     load_positional_embedder, \
     load_canonical_mlp, \
     load_mweight_vol_decoder, \
     load_pose_decoder, \
     load_non_rigid_motion_mlp, \
-    load_vibe
+    load_vibe, \
+    load_motion_discriminator
+
+from smplx import SMPL, SMPLLayer
 
 from configs import cfg
+
+
+def skeleton_to_bbox(skeleton):
+    min_xyz = torch.min(skeleton, dim=0)[0] - cfg.bbox_offset
+    max_xyz = torch.max(skeleton, dim=0)[0] + cfg.bbox_offset
+
+    return torch.stack([min_xyz, max_xyz])
+
+
+def _construct_G(R_mtx, T):
+    r""" Build 4x4 [R|T] matrix from rotation matrix, and translation vector
+    
+    Args:
+        - R_mtx: Array (3, 3)
+        - T: Array (3,)
+
+    Returns:
+        - Array (4, 4)
+    """
+    tmp = torch.zeros(1, 4)
+    tmp[0, 3] = 1.
+    G = torch.cat([torch.cat([R_mtx, T[None, :].T], dim=1), tmp])
+
+    return G
+
+
+def _std_to_scale_mtx(stds):
+    r""" Build scale matrix from standard deviations
+    
+    Args:
+        - stds: Array(3,)
+
+    Returns:
+        - Array (3, 3)
+    """
+
+    scale_mtx = torch.eye(3, dtype=torch.float32)
+    scale_mtx[0][0] = 1.0/stds[0]
+    scale_mtx[1][1] = 1.0/stds[1]
+    scale_mtx[2][2] = 1.0/stds[2]
+
+    return scale_mtx
+
+
+def _to_skew_matrix(v):
+    r""" Compute the skew matrix given a 3D vectors.
+
+    Args:
+        - v: Array (3, )
+
+    Returns:
+        - Array (3, 3)
+
+    """
+    vx, vy, vz = v.ravel()
+    return torch.tensor([[0, -vz, vy],
+                         [vz, 0, -vx],
+                         [-vy, vx, 0]])
+
+
+def _to_skew_matrices(batch_v):
+    r""" Compute the skew matrix given 3D vectors. (batch version)
+
+    Args:
+        - batch_v: Array (N, 3)
+
+    Returns:
+        - Array (N, 3, 3)
+
+    """
+    batch_size = batch_v.shape[0]
+    skew_matrices = torch.zeros(size=(batch_size, 3, 3), dtype=torch.float32)
+
+    for i in range(batch_size):
+        skew_matrices[i] = _to_skew_matrix(batch_v[i])
+
+    return skew_matrices
+
+
+def _get_rotation_mtx(v1, v2):
+    r""" Compute the rotation matrices between two 3D vector. (batch version)
+    
+    Args:
+        - v1: Array (N, 3)
+        - v2: Array (N, 3)
+
+    Returns:
+        - Array (N, 3, 3)
+
+    Reference:
+        https://math.stackexchange.com/questions/180418/calculate-rotation-matrix-to-align-vector-a-to-vector-b-in-3d
+    """
+
+    batch_size = v1.shape[0]
+    # v1 = v1 / torch.clip(torch.norm(v1, dim=-1, keepdim=True), 1e-5, None)
+    # v2 = v2 / torch.clip(torch.norm(v2, dim=-1, keepdim=True), 1e-5, None)
+    v1 = v1 / torch.norm(v1)
+    v2 = v2 / torch.norm(v2)
+    
+    normal_vec = torch.cross(v1, v2, dim=-1)
+    cos_v = torch.zeros(size=(batch_size, 1))
+    for i in range(batch_size):
+        cos_v[i] = v1[i].dot(v2[i])
+
+    skew_mtxs = _to_skew_matrices(normal_vec)
+    
+    Rs = torch.zeros(size=(batch_size, 3, 3), dtype=torch.float32)
+    for i in range(batch_size):
+        Rs[i] = torch.eye(3) + skew_mtxs[i] + \
+                    (skew_mtxs[i].matmul(skew_mtxs[i])) * (1./(1. + cos_v[i]))
+    
+    return Rs
+
+
+def get_canonical_global_tfms(canonical_joints):
+    r""" Convert canonical joints to 4x4 global transformation matrix.
+    
+    Args:
+        - canonical_joints: Array (Total_Joints, 3)
+
+    Returns:
+        - Array (Total_Joints, 4, 4)
+    """
+    total_bones = canonical_joints.shape[0]
+    ident = torch.eye(3).expand(size=(total_bones, 3, 3)) # (Total_Joints, 3, 3)
+    gtfms = torch.cat([ident, canonical_joints[:, :, None]], dim=2) # (Total_Joints, 3, 4)
+    tmp = torch.zeros(size=(24, 1, 4))
+    tmp[:, :, 3] = 1
+    gtfms = torch.cat([gtfms, tmp], dim=1) # (Total_Joints, 4, 4)
+
+    return gtfms
+
+
+def body_pose_to_body_Ts(tpose_joints):
+    r""" Convert body pose to global rotation matrix R and translation T.
+    
+    Args:
+        - jangles (joint angles): Array (Total_Joints x 3, )
+        - tpose_joints:           Array (Total_Joints, 3)
+
+    Returns:
+        - Rs: Array (Total_Joints, 3, 3)
+        - Ts: Array (Total_Joints, 3)
+    """
+
+    total_joints = tpose_joints.shape[0]
+
+    Ts = torch.zeros(size=[total_joints, 3], dtype=torch.float32)
+    Ts[0] = tpose_joints[0,:]
+
+    for i in range(1, total_joints):
+        Ts[i] = tpose_joints[i,:] - tpose_joints[SMPL_PARENT[i], :]
+    
+    return Ts
+
+
+def get_rays_from_KRT(H, W, K, R, T):
+    r""" Sample rays on an image based on camera matrices (K, R and T)
+
+    Args:
+        - H: Integer
+        - W: Integer
+        - K: Tensor (3, 3)
+        - R: Tensor (3, 3)
+        - T: Tensor (3, )
+        
+    Returns:
+        - rays_o: Array (H, W, 3)
+        - rays_d: Array (H, W, 3)
+    """
+
+    # calculate the camera origin
+    rays_o = -torch.matmul(T[None, :], R).ravel()
+    # calculate the world coodinates of pixels
+    i, j = np.meshgrid(np.arange(W, dtype=np.float32),
+                       np.arange(H, dtype=np.float32),
+                       indexing='xy')
+    xy1 = np.stack([i, j, np.ones_like(i)], axis=2)
+    xy1 = torch.from_numpy(xy1)
+    pixel_camera = torch.matmul(xy1, torch.inverse(K).T)
+    pixel_world = torch.matmul(pixel_camera - T.ravel(), R)
+    # calculate the ray direction
+    rays_d = pixel_world - rays_o[None, None]
+    rays_o = torch.broadcast_to(rays_o, rays_d.shape)
+    return rays_o, rays_d
+
+
+def get_camera_parameters(pred_cam, img_size, global_orient):
+    FOCAL_LENGTH = 5000.
+
+    cam_intrinsics = torch.eye(3)
+    cam_intrinsics[0, 0] = FOCAL_LENGTH
+    cam_intrinsics[1, 1] = FOCAL_LENGTH
+    cam_intrinsics[0, 2] = img_size / 2. 
+    cam_intrinsics[1, 2] = img_size / 2.
+
+    cam_s, cam_tx, cam_ty = pred_cam
+    trans = [cam_tx, cam_ty, 2*FOCAL_LENGTH/(img_size*cam_s + 1e-9)]
+
+    cam_extrinsics = torch.eye(4)
+    cam_extrinsics[:3, 3] = torch.stack(trans)
+
+    global_tfms = torch.eye(4)
+    global_tfms[:3, :3] = global_orient
+
+    return cam_intrinsics, torch.matmul(cam_extrinsics, global_tfms.T)
+
+
+def rays_intersect_3d_bbox(bounds, ray_o, ray_d):
+    r"""calculate intersections with 3d bounding box
+        Args:
+            - bounds: (2, 3)
+            - ray_o: (N_rays, 3)
+            - ray_d, (N_rays, 3)
+        Output:
+            - near: (N_VALID_RAYS, )
+            - far: (N_VALID_RAYS, )
+            - mask_at_box: (N_RAYS, )
+    """
+
+    bounds = bounds + torch.tensor([-0.01, 0.01])[:, None]
+    nominator = bounds[None] - ray_o[:, None] # (N_rays, 2, 3)
+    # calculate the step of intersections at six planes of the 3d bounding box
+    ray_d[torch.abs(ray_d) < 1e-5] = 1e-5
+    d_intersect = (nominator / ray_d[:, None]).reshape(-1, 6) # (N_rays, 6)
+    # calculate the six interections
+    p_intersect = d_intersect[..., None] * ray_d[:, None] + ray_o[:, None] # (N_rays, 6, 3)
+    # calculate the intersections located at the 3d bounding box
+    min_x, min_y, min_z, max_x, max_y, max_z = bounds.ravel()
+    eps = 1e-6
+    p_mask_at_box = (p_intersect[..., 0] >= (min_x - eps)) * \
+                    (p_intersect[..., 0] <= (max_x + eps)) * \
+                    (p_intersect[..., 1] >= (min_y - eps)) * \
+                    (p_intersect[..., 1] <= (max_y + eps)) * \
+                    (p_intersect[..., 2] >= (min_z - eps)) * \
+                    (p_intersect[..., 2] <= (max_z + eps))  # (N_rays, 6)
+    # obtain the intersections of rays which intersect exactly twice
+    mask_at_box = p_mask_at_box.sum(-1) == 2  #(N_rays, )
+    p_intervals = p_intersect[mask_at_box][p_mask_at_box[mask_at_box]].reshape(
+        -1, 2, 3) # (N_VALID_rays, 2, 3)
+
+    # calculate the step of intersections
+    ray_o = ray_o[mask_at_box]
+    ray_d = ray_d[mask_at_box]
+    norm_ray = torch.norm(ray_d, dim=1)
+    d0 = torch.norm(p_intervals[:, 0] - ray_o, dim=1) / norm_ray
+    d1 = torch.norm(p_intervals[:, 1] - ray_o, dim=1) / norm_ray
+    near = torch.minimum(d0, d1)
+    far = torch.maximum(d0, d1)
+
+    return near, far, mask_at_box
+
+
+def _deform_gaussian_volume(
+        grid_size, 
+        bbox_min_xyz,
+        bbox_max_xyz,
+        center, 
+        scale_mtx, 
+        rotation_mtx):
+    r""" Deform a standard Gaussian volume.
+    
+    Args:
+        - grid_size:    Integer
+        - bbox_min_xyz: Array (3, )
+        - bbox_max_xyz: Array (3, )
+        - center:       Array (3, )   - center of Gaussain to be deformed
+        - scale_mtx:    Array (3, 3)  - scale of Gaussain to be deformed
+        - rotation_mtx: Array (3, 3)  - rotation matrix of Gaussain to be deformed
+
+    Returns:
+        - Array (grid_size, grid_size, grid_size)
+    """
+
+    R = rotation_mtx
+    S = scale_mtx
+
+    # covariance matrix after scaling and rotation
+    SIGMA = R.matmul(S).matmul(S).matmul(R.T)
+
+    min_x, min_y, min_z = bbox_min_xyz
+    max_x, max_y, max_z = bbox_max_xyz
+    
+    x_linspace = torch.linspace(0, 1, grid_size) * (max_x - min_x) + min_x
+    y_linspace = torch.linspace(0, 1, grid_size) * (max_y - min_y) + min_y
+    z_linspace = torch.linspace(0, 1, grid_size) * (max_z - min_z) + min_z
+
+    zgrid, ygrid, xgrid = torch.meshgrid(x_linspace, y_linspace, z_linspace)
+    grid = torch.stack([xgrid - center[0], 
+                        ygrid - center[1], 
+                        zgrid - center[2]],
+                    dim=-1)
+
+    dist = torch.einsum('abci, abci->abc', torch.einsum('abci, ij->abcj', grid, SIGMA), grid)
+
+    return torch.exp(-1 * dist)
+
+
+def approx_gaussian_bone_volumes(
+    tpose_joints, 
+    bbox_min_xyz, bbox_max_xyz,
+    grid_size=32):
+    r""" Compute approximated Gaussian bone volume.
+    
+    Args:
+        - tpose_joints:  Array (Total_Joints, 3)
+        - bbox_min_xyz:  Array (3, )
+        - bbox_max_xyz:  Array (3, )
+        - grid_size:     Integer
+        - has_bg_volume: boolean
+
+    Returns:
+        - Array (Total_Joints + 1, 3, 3, 3)
+    """
+
+    total_joints = tpose_joints.shape[0]
+
+    grid_shape = [grid_size] * 3
+
+    calibrated_bone = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32)[None, :]
+    g_volumes = []
+    for joint_idx in range(0, total_joints):
+        gaussian_volume = torch.zeros(size=grid_shape, dtype=torch.float32)
+
+        is_parent_joint = False
+        for bone_idx, parent_idx in SMPL_PARENT.items():
+            if joint_idx != parent_idx:
+                continue
+
+            S = _std_to_scale_mtx(BONE_STDS * 2.)
+            if joint_idx in TORSO_JOINTS:
+                S[0][0] *= 1/1.5
+                S[2][2] *= 1/1.5
+
+            start_joint = tpose_joints[SMPL_PARENT[bone_idx]]
+            end_joint = tpose_joints[bone_idx]
+            target_bone = (end_joint - start_joint)[None, :]
+
+            R = _get_rotation_mtx(calibrated_bone, target_bone)[0]
+
+            center = (start_joint + end_joint) / 2.0
+
+            bone_volume = _deform_gaussian_volume(
+                            grid_size, 
+                            bbox_min_xyz,
+                            bbox_max_xyz,
+                            center, S, R)
+            gaussian_volume = gaussian_volume + bone_volume
+
+            is_parent_joint = True
+
+        if not is_parent_joint:
+            # The joint is not other joints' parent, meaning it is an end joint
+            joint_stds = HEAD_STDS if joint_idx == SMPL_JOINT_IDX['head'] else JOINT_STDS
+            S = _std_to_scale_mtx(joint_stds * 2.)
+
+            center = tpose_joints[joint_idx]
+            gaussian_volume = _deform_gaussian_volume(
+                                grid_size, 
+                                bbox_min_xyz,
+                                bbox_max_xyz,
+                                center, 
+                                S, 
+                                torch.eye(3, dtype=torch.float32))
+            
+        g_volumes.append(gaussian_volume)
+    g_volumes = torch.stack(g_volumes, dim=0)
+
+    # concatenate background weights
+    bg_volume = 1.0 - torch.sum(g_volumes, dim=0, keepdims=True).clip(min=0.0, max=1.0)
+    g_volumes = torch.cat([g_volumes, bg_volume], dim=0)
+    g_volumes = g_volumes / torch.sum(g_volumes, dim=0, keepdims=True).clip(min=0.001)
+    
+    return g_volumes
 
 
 class Network(nn.Module):
@@ -20,8 +401,31 @@ class Network(nn.Module):
         if cfg.single_gpu == True:
             torch.cuda.set_device(cfg.primary_gpus[0])
 
+        self.volume_size = cfg.mweight_volume.volume_size
+
         # pose detector
-        self.pose_detector = None #load_vibe() # TODO
+        self.pose_detector = load_vibe(cfg.vibe.module)(
+            pretrained={
+                'hmr': cfg.vibe.hmr_pretrained_path,
+                'gru': cfg.vibe.gru_pretrained_path
+            },
+            seqlen=cfg.vibe.seqlen,
+            batch_size=cfg.train.batch_size,
+            n_layers=cfg.vibe.tgru.n_layers,
+            hidden_size=cfg.vibe.tgru.hidden_size,
+            add_linear=cfg.vibe.tgru.add_linear,
+            bidirectional=cfg.vibe.tgru.bidirectional,
+            use_residual=cfg.vibe.tgru.use_residual,
+        )
+
+        # motion discriminator
+        self.motion_discriminator = load_motion_discriminator(cfg.motion_discriminator.module)(
+            rnn_size=cfg.motion_discriminator.hidden_size,
+            input_size=69,
+            n_layers=cfg.motion_discriminator.n_layers,
+            output_size=1,
+            feature_pool=cfg.motion_discriminator.feature_pool,
+        ) # TODO
 
         # motion basis computer
         self.motion_basis_computer = MotionBasisComputer(
@@ -349,17 +753,70 @@ class Network(nn.Module):
         total_bones = cfg.total_bones - 1
         return torch.matmul(Rs.reshape(-1, 3, 3),
                             correct_Rs.reshape(-1, 3, 3)).reshape(-1, total_bones, 3, 3)
-
     
+
     def forward(self,
-                rays, 
-                dst_Rs, dst_Ts, cnl_gtfms,
-                motion_weights_priors,
-                dst_posevec=None,
-                near=None, far=None,
+                imgs, alphas, bgcolor,
                 iter_val=1e7,
                 **kwargs):
+        H, W = imgs.shape[1: 3]
+        assert H == W
 
+        imgs = imgs.permute(0, 3, 1, 2)
+        vibe_output = self.pose_detector(imgs)
+
+        dst_Rs = vibe_output[0]['rmtx'][0][0]
+        betas = vibe_output[0]['shape'][0].mean(axis=0)
+        pred_cam = vibe_output[0]['cam'][0][0]
+        global_orient = dst_Rs[0]
+        body_pose = dst_Rs[1:]
+        t_pose = torch.eye(body_pose.shape[1]).expand(body_pose.shape)
+        path = osp.join("third_parties", "smpl", "models", "basicModel_neutral_lbs_10_207_0_v1.0.0.pkl")
+        
+        smpl_output = SMPLLayer(path, batch_size=1).to('cpu')(
+            betas=betas[None, :].to('cpu'), 
+            body_pose=body_pose[None, :].to('cpu'),
+            global_orient=global_orient[None, :].to('cpu')
+        )
+
+        joints = smpl_output['joints'][0][0:24]
+        bbox = skeleton_to_bbox(joints)
+
+        tpose_output = SMPLLayer(path, batch_size=1).to('cpu')(
+            betas=betas[None, :].to('cpu'), 
+            body_pose=t_pose[None, :].to('cpu')
+        )
+
+        dst_posevec = vibe_output[0]['pose'][0][0][1:, ].ravel()
+        canonical_joints = tpose_output['joints'][0][0:24]
+        canonical_bbox = skeleton_to_bbox(canonical_joints)
+        dst_Ts = body_pose_to_body_Ts(canonical_joints)
+        cnl_gtfms = get_canonical_global_tfms(canonical_joints)
+
+        K, E = get_camera_parameters(pred_cam, H, global_orient)
+        R = E[:3, :3]
+        T = E[:3, 3]
+        
+        rays_o, rays_d = get_rays_from_KRT(H, W, K, R, T)
+        ray_img = imgs[0].reshape(-1, 3) 
+        rays_o = rays_o.reshape(-1, 3)
+        rays_d = rays_d.reshape(-1, 3)
+        
+        near, far, ray_mask = rays_intersect_3d_bbox(bbox, rays_o, rays_d)
+        rays_o = rays_o[ray_mask]
+        rays_d = rays_d[ray_mask]
+        ray_img = ray_img[ray_mask]
+
+        near = near[:, None]
+        far = far[:, None]
+
+        motion_weights_priors = \
+                approx_gaussian_bone_volumes(
+                    canonical_joints,   
+                    bbox[0],
+                    bbox[1],
+                    grid_size=self.volume_size)
+        
         dst_Rs=dst_Rs[None, ...]
         dst_Ts=dst_Ts[None, ...]
         dst_posevec=dst_posevec[None, ...]
@@ -401,27 +858,30 @@ class Network(nn.Module):
         })
 
         motion_scale_Rs, motion_Ts = self._get_motion_base(
-                                            dst_Rs=dst_Rs, 
-                                            dst_Ts=dst_Ts, 
-                                            cnl_gtfms=cnl_gtfms)
+                                            dst_Rs=dst_Rs.to(cfg.primary_gpus[0]), 
+                                            dst_Ts=dst_Ts.to(cfg.primary_gpus[0]), 
+                                            cnl_gtfms=cnl_gtfms.to(cfg.primary_gpus[0]))
         motion_weights_vol = self.mweight_vol_decoder(
-            motion_weights_priors=motion_weights_priors)
+            motion_weights_priors=motion_weights_priors.to(cfg.primary_gpus[0]))
         motion_weights_vol=motion_weights_vol[0] # remove batch dimension
 
+        canonical_bbox = canonical_bbox.to(cfg.primary_gpus[0])
         kwargs.update({
             'motion_scale_Rs': motion_scale_Rs,
             'motion_Ts': motion_Ts,
-            'motion_weights_vol': motion_weights_vol
+            'motion_weights_vol': motion_weights_vol,
+            'cnl_bbox_min_xyz': canonical_bbox[0],
+            'cnl_bbox_max_xyz': canonical_bbox[1],
+            'cnl_bbox_scale_xyz': 2.0 / (canonical_bbox[1] - canonical_bbox[0])
         })
 
-        rays_o, rays_d = rays
         rays_shape = rays_d.shape 
 
         rays_o = torch.reshape(rays_o, [-1,3]).float()
         rays_d = torch.reshape(rays_d, [-1,3]).float()
         packed_ray_infos = torch.cat([rays_o, rays_d, near, far], -1)
 
-        all_ret = self._batchify_rays(packed_ray_infos, **kwargs)
+        all_ret = self._batchify_rays(packed_ray_infos.to(cfg.primary_gpus[0]), **kwargs)
         for k in all_ret:
             k_shape = list(rays_shape[:-1]) + list(all_ret[k].shape[1:])
             all_ret[k] = torch.reshape(all_ret[k], k_shape)

@@ -11,7 +11,7 @@ class Logger(object):
         path = os.path.join(cfg.logdir, 'logs.txt')
 
         log_dir = cfg.logdir
-        if not cfg.resume and os.path.exists(log_dir):
+        if not cfg.resume and os.path.exists(log_dir) and not __debug__:
             user_input = input(f"log dir \"{log_dir}\" exists. \nRemove? (y/n):")
             if user_input == 'y':
                 print(colored('remove contents of directory %s' % log_dir, 'red'))

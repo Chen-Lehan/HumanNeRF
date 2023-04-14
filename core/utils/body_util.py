@@ -1,5 +1,6 @@
 from math import cos, sin
 
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -37,7 +38,8 @@ SMPL_PARENT = {
     11: 8, 12: 9, 13: 9, 14: 9, 15: 12, 16: 13, 17: 14, 18: 16, 19: 17, 20: 18, 
     21: 19, 22: 20, 23: 21}
 
-SMPL_MEAN_PARAMS = 85
+VIBE_DATA_DIR = '../data'
+SMPL_MEAN_PARAMS = os.path.join(VIBE_DATA_DIR, 'smpl_mean_params.npz')
 TORSO_JOINTS_NAME = [
     'pelvis_root', 'belly_button', 'lower_chest', 'upper_chest', 'left_clavicle', 'right_clavicle'
 ]

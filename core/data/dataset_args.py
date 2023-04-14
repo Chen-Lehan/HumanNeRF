@@ -37,6 +37,26 @@ class DatasetArgs(object):
             },
         })
 
+    if cfg.category == 'human_vibe_nerf' and cfg.task == 'zju_mocap':
+        for sub in subjects:
+            dataset_attrs.update({
+                f"zju_{sub}_train": {
+                    "dataset_path": f"dataset/zju_mocap/{sub}",
+                    "seqlen": cfg.vibe.seqlen,
+                    "stride": cfg.vibe.stride,
+                    "keyfilter": cfg.train_keyfilter,
+                    "ray_shoot_mode": cfg.train.ray_shoot_mode,
+                },
+                f"zju_{sub}_test": {
+                    "dataset_path": f"dataset/zju_mocap/{sub}",
+                    "seqlen": cfg.vibe.seqlen,
+                    "stride": cfg.vibe.stride,
+                    "keyfilter": cfg.test_keyfilter,
+                    "ray_shoot_mode": 'image',
+                    "src_type": 'zju_mocap'
+                },
+            })
+
 
     @staticmethod
     def get(name):

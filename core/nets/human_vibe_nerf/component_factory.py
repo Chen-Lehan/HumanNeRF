@@ -29,3 +29,8 @@ def load_vibe(module_name):
     module = module_name
     module_path = module.replace(".", "/") + ".py"
     return imp.load_source(module, module_path).VIBE
+
+def load_motion_discriminator(module_name):
+    module = module_name
+    module_path = module.replace(".", "/") + ".py"
+    return imp.load_source(module, module_path).MotionDiscriminator

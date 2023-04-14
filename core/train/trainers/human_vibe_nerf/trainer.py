@@ -141,6 +141,7 @@ class Trainer(object):
             batch['iter_val'] = torch.full((1,), self.iter)
             data = cpu_data_to_gpu(
                 batch, exclude_keys=EXCLUDE_KEYS_TO_GPU)
+
             net_output = self.network(**data)
 
             train_loss, loss_dict = self.get_loss(

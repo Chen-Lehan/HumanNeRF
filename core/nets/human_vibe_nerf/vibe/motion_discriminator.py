@@ -18,14 +18,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
-from attention import SelfAttention
+from core.utils.network_util import SelfAttention
 
 class MotionDiscriminator(nn.Module):
 
     def __init__(self,
                  rnn_size,
                  input_size,
-                 num_layers,
+                 n_layers,
                  output_size=2,
                  feature_pool="concat",
                  use_spectral_norm=False,
@@ -37,12 +37,12 @@ class MotionDiscriminator(nn.Module):
         self.input_size = input_size
         self.rnn_size = rnn_size
         self.feature_pool = feature_pool
-        self.num_layers = num_layers
+        self.n_layers = n_layers
         self.attention_size = attention_size
         self.attention_layers = attention_layers
         self.attention_dropout = attention_dropout
 
-        self.gru = nn.GRU(self.input_size, self.rnn_size, num_layers=num_layers)
+        self.gru = nn.GRU(self.input_size, self.rnn_size, num_layers=n_layers)
 
         linear_size = self.rnn_size if not feature_pool == "concat" else self.rnn_size * 2
 

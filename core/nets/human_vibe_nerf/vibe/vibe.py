@@ -20,52 +20,27 @@ import os.path as osp
 import torch.nn as nn
 import torch.nn.functional as F
 
-from lib.core.config import VIBE_DATA_DIR
-from spin import Regressor, hmr
+from core.utils.network_util import TemporalEncoder, Regressor, HMR, Bottleneck
 
-
-class TemporalEncoder(nn.Module):
-    def __init__(
-            self,
-            n_layers=1,
-            hidden_size=2048,
-            add_linear=False,
-            bidirectional=False,
-            use_residual=True
-    ):
-        super(TemporalEncoder, self).__init__()
-
-        self.gru = nn.GRU(
-            input_size=2048,
-            hidden_size=hidden_size,
-            bidirectional=bidirectional,
-            num_layers=n_layers
-        )
-
-        self.linear = None
-        if bidirectional:
-            self.linear = nn.Linear(hidden_size*2, 2048)
-        elif add_linear:
-            self.linear = nn.Linear(hidden_size, 2048)
-        self.use_residual = use_residual
-
-    def forward(self, x):
-        n,t,f = x.shape
-        x = x.permute(1,0,2) # NTF -> TNF
-        y, _ = self.gru(x)
-        if self.linear:
-            y = F.relu(y)
-            y = self.linear(y.view(-1, y.size(-1)))
-            y = y.view(t,n,f)
-        if self.use_residual and y.shape[-1] == 2048:
-            y = y + x
-        y = y.permute(1,0,2) # TNF -> NTF
-        return y
-
+EXCLUDE_LAYERS = [
+    'regressor.smpl.betas',
+    'regressor.smpl.global_orient',
+    'regressor.smpl.body_pose',
+    'regressor.smpl.faces_tensor',
+    'regressor.smpl.v_template',
+    'regressor.smpl.shapedirs',
+    'regressor.smpl.J_regressor',
+    'regressor.smpl.posedirs',
+    'regressor.smpl.parents',
+    'regressor.smpl.lbs_weights',
+    'regressor.smpl.J_regressor_extra',
+    'regressor.smpl.vertex_joint_selector.extra_joints_idxs',
+]
 
 class VIBE(nn.Module):
     def __init__(
             self,
+            pretrained,
             seqlen,
             batch_size=64,
             n_layers=1,
@@ -73,13 +48,12 @@ class VIBE(nn.Module):
             add_linear=False,
             bidirectional=False,
             use_residual=True,
-            pretrained=osp.join(VIBE_DATA_DIR, 'spin_model_checkpoint.pth.tar'),
     ):
 
         super(VIBE, self).__init__()
 
         self.seqlen = seqlen
-        self.batch_size = batch_size
+        self.batch_size = batch_size 
 
         self.encoder = TemporalEncoder(
             n_layers=n_layers,
@@ -89,91 +63,42 @@ class VIBE(nn.Module):
             use_residual=use_residual,
         )
 
-        # regressor can predict cam, pose and shape params in an iterative way
-        self.regressor = Regressor()
-
-        if pretrained and os.path.isfile(pretrained):
-            pretrained_dict = torch.load(pretrained, map_location='cpu')['model']
-
-            self.regressor.load_state_dict(pretrained_dict, strict=False)
-            print(f'=> loaded pretrained model from \'{pretrained}\'')
-
-
-    def forward(self, input, J_regressor=None):
-        # input size NTF
-        batch_size, seqlen = input.shape[:2]
-
-        feature = self.encoder(input)
-        feature = feature.reshape(-1, feature.size(-1))
-
-        smpl_output = self.regressor(feature, J_regressor=J_regressor)
-        for s in smpl_output:
-            s['theta'] = s['theta'].reshape(batch_size, seqlen, -1)
-            s['verts'] = s['verts'].reshape(batch_size, seqlen, -1, 3)
-            s['kp_2d'] = s['kp_2d'].reshape(batch_size, seqlen, -1, 2)
-            s['kp_3d'] = s['kp_3d'].reshape(batch_size, seqlen, -1, 3)
-            s['rotmat'] = s['rotmat'].reshape(batch_size, seqlen, -1, 3, 3)
-
-        return smpl_output
-
-
-class VIBE_Demo(nn.Module):
-    def __init__(
-            self,
-            seqlen,
-            batch_size=64,
-            n_layers=1,
-            hidden_size=2048,
-            add_linear=False,
-            bidirectional=False,
-            use_residual=True,
-            pretrained=osp.join(VIBE_DATA_DIR, 'spin_model_checkpoint.pth.tar'),
-    ):
-
-        super(VIBE_Demo, self).__init__()
-
-        self.seqlen = seqlen
-        self.batch_size = batch_size
-
-        self.encoder = TemporalEncoder(
-            n_layers=n_layers,
-            hidden_size=hidden_size,
-            bidirectional=bidirectional,
-            add_linear=add_linear,
-            use_residual=use_residual,
-        )
-
-        self.hmr = hmr()
-        checkpoint = torch.load(pretrained)
-        self.hmr.load_state_dict(checkpoint['model'], strict=False)
+        self.hmr = HMR(Bottleneck, [3, 4, 6, 3])
 
         # regressor can predict cam, pose and shape params in an iterative way
         self.regressor = Regressor()
 
-        if pretrained and os.path.isfile(pretrained):
-            pretrained_dict = torch.load(pretrained)['model']
+        hmr_pretrained_path, gru_pretrained_path = pretrained['hmr'], pretrained['gru']
+        
+        hmr_pretrained_dict = torch.load(hmr_pretrained_path, map_location='cpu')['model']
+        self.hmr.load_state_dict(hmr_pretrained_dict, strict=False)
+        print(f'=> loaded pretrained spin model from \'{hmr_pretrained_path}\'')
 
-            self.regressor.load_state_dict(pretrained_dict, strict=False)
-            print(f'=> loaded pretrained model from \'{pretrained}\'')
+        gru_pretrained_dict = torch.load(gru_pretrained_path, map_location='cpu')['gen_state_dict']
+        self.load_state_dict(gru_pretrained_dict, strict=False)
+        print(f'=> loaded pretrained vibe model from \'{gru_pretrained_path}\'')
 
 
-    def forward(self, input, J_regressor=None):
-        # input size NTF
-        batch_size, seqlen, nc, h, w = input.shape
+    def forward(self, input):
+        # input size NTHWC or THWC
+        if len(input.shape) == 5:
+            batch_size, seqlen, H, W, C = input.shape[:]
+            input = input.reshape(-1, H, W, C)
+        else:
+            batch_size = 1
+            seqlen, H, W, C = input.shape[:]
 
-        feature = self.hmr.feature_extractor(input.reshape(-1, nc, h, w))
+        assert len(input.shape) == 4
 
-        feature = feature.reshape(batch_size, seqlen, -1)
-        feature = self.encoder(feature)
+        inf = self.hmr(input).reshape(batch_size, seqlen, -1)
+        feature = self.encoder(inf)
         feature = feature.reshape(-1, feature.size(-1))
 
-        smpl_output = self.regressor(feature, J_regressor=J_regressor)
-
+        smpl_output = self.regressor(feature)
         for s in smpl_output:
-            s['theta'] = s['theta'].reshape(batch_size, seqlen, -1)
-            s['verts'] = s['verts'].reshape(batch_size, seqlen, -1, 3)
-            s['kp_2d'] = s['kp_2d'].reshape(batch_size, seqlen, -1, 2)
-            s['kp_3d'] = s['kp_3d'].reshape(batch_size, seqlen, -1, 3)
-            s['rotmat'] = s['rotmat'].reshape(batch_size, seqlen, -1, 3, 3)
+            s['cam']   = s['cam'].reshape(batch_size, seqlen, -1)
+            s['shape'] = s['shape'].reshape(batch_size, seqlen, -1)
+            s['rmtx']  = s['rmtx'].reshape(batch_size, seqlen, -1, 3, 3)
+            s['pose']  = s['pose'].reshape(batch_size, seqlen, -1, 3)
 
         return smpl_output

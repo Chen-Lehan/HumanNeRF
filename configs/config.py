@@ -22,7 +22,7 @@ _C.render_skip = 1
 _C.render_frames = 100
 
 # for data loader
-_C.num_workers = 4
+_C.num_workers = 4 # for debug # todo
 
 
 def get_cfg_defaults():
@@ -64,19 +64,25 @@ def set_single_gpu(cfg, gpu_id):
 
 def make_cfg(args):
     cfg = get_cfg_defaults()
-    cfg.merge_from_file('configs/default.yaml')
+    cfg.single_gpu = False
+
+    if args.model == "human_vibe_nerf":
+        cfg.merge_from_file('configs/default_for_vibe.yaml')
+        set_single_gpu(cfg, 1)
+    elif args.model == "human_nerf":
+        cfg.merge_from_file('configs/default.yaml')
+        set_single_gpu(cfg, 1)
     cfg.merge_from_file(args.cfg)
     cfg.merge_from_list(args.opts)
     parse_cfg(cfg)
 
-    cfg.single_gpu = False
-    set_single_gpu(cfg, 2)
     # determine_primary_secondary_gpus(cfg)
         
     return cfg
 
 
 parser = argparse.ArgumentParser()
+parser.add_argument("--model", default="human_nerf", type=str)
 parser.add_argument("--cfg", required=True, type=str)
 parser.add_argument("--type", default="skip", type=str)
 parser.add_argument("opts", default=None, nargs=argparse.REMAINDER)

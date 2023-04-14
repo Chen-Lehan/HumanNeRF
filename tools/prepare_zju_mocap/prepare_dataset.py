@@ -134,7 +134,7 @@ def main(argv):
 
         betas = smpl_params['shapes'][0] #(10,)
         poses = smpl_params['poses'][0]  #(72,)
-        Rh = smpl_params['Rh'][0]  #(3,)
+        Rh =  ['Rh'][0]  #(3,)
         Th = smpl_params['Th'][0]  #(3,)
         
         all_betas.append(betas)
